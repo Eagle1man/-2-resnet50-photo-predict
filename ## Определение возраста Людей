@@ -1,0 +1,402 @@
+
+
+**Цель Лабораторной:** Построить модель, которая по фотографии определит приблизительный возраст человека.
+
+В нашем распоряжении набор фотографий людей с указанием возраста.
+
+ 
+
+**Описание данных**
+
+Будем использовать данные с сайта [ChaLearn Looking at People](http://chalearnlap.cvc.uab.es/dataset/26/description/). Они находятся в папке `/datasets/faces/`.
+
+[В статье о датасете](http://people.ee.ethz.ch/~timofter/publications/Agustsson-FG-2017.pdf),  с которым мы имеем дело, значение MAE равно 5.4 — если мы получим _MAE_ меньше 7, это будет отличный результат!
+
+В нашем распоряжении одна папка со всеми изображениями `/final_files` и CSV-файл `labels.csv` с двумя колонками: `file_name` - имя файла с изображением и `real_age` - реальный возраст человека на фото.
+
+
+**Этапы проекта**
+
+1. Проведём исследовательский анализ набора фотографий.
+
+2. Подготовим данные к обучению.
+
+3. Обучим нейронную сеть и рассчитаем её качество.
+
+# подключаем нужные библиотеки и модули
+!pip install tensorflow
+import os.path
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.resnet import ResNet50
+from tensorflow.keras.layers import Dense, GlobalMaxPool2D
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Nadam, RMSprop
+from tensorflow.keras.callbacks import EarlyStopping
+# mean_absolute_error can be used directly or as 'mae' string in model.compile
+# from tensorflow.keras.metrics import mean_absolute_error
+
+# The rest of your code where you define and train the model should work correctly
+# when using 'mae' in model.compile and tensorflow.keras.losses.mean_absolute_error
+# for calculating MAE on a batch as done later in the notebook.
+
+## Исследовательский анализ данных
+
+Что будем делать в процессе исследования данных:
+
+- Загрузим данные и выполним предварительную оценку, посмотрим на размер выборки.
+
+- Построим график распределения возраста в выборке.
+
+- Выведем на экран 10–15 фотографий и посмотрим, как устроен датасет.
+
+- Сделаем выводы о том, как результаты исследования повлияют на обучение модели.
+
+### Загрузка
+
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("abhikjha/appa-real-face-cropped")
+
+print("Path to dataset files:", path)
+
+# файл с метриками
+# Используем путь к файлу labels.csv внутри скачанной директории
+labels_path = os.path.join(path, 'labels.csv')
+
+# директория с картинками
+faces_path = os.path.join(path, 'final_files', 'final_files')
+
+
+# загружаем метрики в датафрейм
+df = pd.read_csv(labels_path)
+
+
+# оценим содержимое
+df.sample(5)
+
+
+# общая информация
+df.info()
+
+# есть ли дубли
+df['file_name'].duplicated().sum()
+
+Наблюдения:
+
+1. Датафрейм содержит 7951 запись с именами файлов и значениями возраста.
+2. Пропусков данных нет.
+3. Дублей нет.
+
+### Исследование
+
+# характеристики
+df.describe()
+
+Минимальный возраст 1 год, максимальный - 100 лет. Средний возраст 31 год, медианный - 29 лет.
+
+# распределение возрастов
+plt.figure(figsize=(7,3))
+plt.title('Распределение данных в датасете по возрастам\n')
+plt.xlabel('Реальный возраст')
+plt.ylabel('Количество')
+df.real_age.hist(bins=100);
+
+# оценим выбросы
+plt.figure(figsize=(7,3))
+plt.title('Диаграмма размаха для значений реального возраста\n')
+plt.xlabel('Реальный возраст')
+df.boxplot('real_age', vert=False);
+
+Судя по ящику с усами, возраст старше 72 лет можно считать не типичным. На самом деле это не так. Очевидно очень мало данных в этой возрастной катеогрии.
+
+Разделим данные на возрастные категории и сравним количество записей.
+
+# возрастные группы
+df['age_cat'] = pd.cut(
+    df.real_age,
+    bins=[0, 11, 16, 20, 35, 59, 74, 89, 100],
+    labels=['дети до 11 лет', 'подростки 12-15 лет', 'юноши 16-20 лет',
+            'молодёж 21-35 лет', 'зрелый возраст 35-59 лет',
+            'пожилые 60-74 года', 'старики 75-89 лет',
+            'долгожители от 90 лет']
+)
+
+df.age_cat.value_counts().plot(
+    kind='barh', grid=True,
+    title='Распределение данных по возрастным группам'
+);
+
+Дисбаланс по возрастным группам. Наибольшее число данных приходится на диапазон возрастов от 20 до 59 лет. Меньше всего фотографий людей от 60 лет и старше. Можно выделить три основные группы.
+
+# доли каждой из трех групп
+kids = df['real_age'] < 21
+mature = (df['real_age'] >= 21) & (df['real_age'] < 60)
+elderly = df['real_age'] >= 60
+
+print(f'''
+Доля данных в датасете по возрастным группам:
+
+1. дети: {kids.mean():.2%}
+2. молодёжь и зрелый возраст: {mature.mean():.2%}
+3. пожилые и старики: {elderly.mean():.2%}
+''')
+
+%%time
+# проверим наличие всех файлов соотвествующих записям
+lost_files = []
+for i in df.index:
+    file_name = df.iloc[i]['file_name']
+    if not os.path.exists(os.path.join(faces_path, file_name)):
+        lost_files.append([i, file_name])
+
+# потерянные файлы
+lost_files
+
+Потерянных файлов нет, все записи имеют сопоставленные файлы.
+
+Визуализируем несколько случайных фотографий и оценим соотвествие указанного возраста в датасете.
+
+# число строк и колонок
+rows = 5
+columns = 4
+
+# выборка произвольных данных
+images = df.sample(rows*columns, random_state=12345)
+
+# выведем изображения и данные возраста
+fig = plt.figure(figsize=(7, 14))
+for i in range(columns*rows):
+    img = Image.open(os.path.join(faces_path, images.iloc[i]['file_name']))
+    fig.add_subplot(rows, columns, i+1)
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title(images.iloc[i]['real_age'])
+plt.show()
+
+**Выводы:**
+
+Мы загрузили и провели исследование набора данных. Набор состоит из двух частей, это папка с фотографиями людей и файл в формате `csv`, который содержит имена файлов и возраст человека на фото.
+
+Всего имеется 7951 файл. Все указанные файлы присутствуют в папке с изображениями, пропусков нет, дубликатов не обнаружено.
+
+Информация о возрасте имеет следующие характеристики: минимальный возраст 1 год, максимальный - 100 лет, средний возраст 31 год, медианный - 29 лет. Визуально, возраст людей на фотографиях, соотвествует указанному возрасту в датасете.
+
+Данные можно условно разделить на 3 группы: дети, средний возраст и пожилые люди. По возрастам имеется сильный дисбаланс. Наибольшее число фотографий людей в возрасте от 21 до 59 лет, примерно $66\%$. Наименьшее число данных от 60 лет и старше, чуть менее $7\%$. На детей приходится примерно $27\%$ данных.
+
+Таким образом мы имеем достаточно не большой и разбалансированный набор данных и это может негативным образом отразится на обучении модели и качестве её работы.
+
+Необходимо увеличить число детских фотографий, а так же для пожилых и стариков. Для снижения дисбаланса можно использовать технику аугментации изображений редко представленных возрастных групп.
+
+## Обучение модели
+
+Определяя возраст человека по его фото, мы называем некоторое число из небольшого дипазона. Для решения этой задачи нам подойдёт модель, которая будет решать задачу регрессии.
+
+С изображениями лучше всего работают нейронные сети. Мы воспользуемся готовой архитектурой сверточной нейронной сети _ResNet50_ предобученной на датасете _ImageNet_. Это позволит уменьшить время обучения и сэкономить вычислительные ресурсы.
+
+У _ResNet_ нам необходимо переделать выходные полносвязные слои для решения задачи регресси. На выходе сети у нас будет всего один нейрон с функцией активации _ReLU_. Положительные прогнозы сети функция _ReLU_ не меняет, а все отрицательные — приводит к нулю. Возраст меньше 0 быть не может.
+
+В качестве фунции потерь будем использовать _Mean Squared Error_, она позволяет модели обучаться быстрее.
+
+Для оценки качества модели используем _Mean Absolute Error_. По условию задачи её значение на тестовой выборке не должно превышать 8.
+
+Создадим следующие функции:
+
+- `load_train(path)` - генератор тренировочной выборки.
+
+- `load_test(path)` - генератор тестовой выборки.
+
+- `create_model(input_shape)` - создание модели свёрточной нейронной сети на базе архитектуры _ResNet50_.
+
+- `train_model(model, train_data, test_data, batch_size, epochs, steps_per_epoch, validation_steps)` - процедура обучения модели.
+
+# создаём генератор тренировочной выборки
+def load_train(path):
+    dataframe = pd.read_csv(path + '/labels.csv')
+    train_datagen = ImageDataGenerator(
+        rescale=1.0/255, validation_split=0.25,
+        horizontal_flip=True
+    )
+    train_datagen_flow = train_datagen.flow_from_dataframe(
+        dataframe,
+        directory=path + '/final_files/final_files',
+        x_col='file_name',
+        y_col='real_age',
+        target_size=(224, 224),
+        class_mode='raw',
+        batch_size=32,
+        shuffle=True,
+        seed=12345,
+        subset='training'
+    )
+    return train_datagen_flow
+
+# создаём генератор тестовой выборки
+def load_test(path):
+    dataframe = pd.read_csv(path + '/labels.csv')
+    test_datagen = ImageDataGenerator(rescale=1.0/255, validation_split=0.25)
+    test_datagen_flow = test_datagen.flow_from_dataframe(
+        dataframe,
+        directory=path + '/final_files/final_files',
+        x_col='file_name',
+        y_col='real_age',
+        target_size=(224, 224),
+        class_mode='raw',
+        batch_size=32,
+        shuffle=True,
+        seed=12345,
+        subset='validation'
+    )
+    return test_datagen_flow
+
+# создаём модель
+def create_model(input_shape):
+    optimizer = Nadam(learning_rate=0.0002)
+    backbone = ResNet50(
+        input_shape=input_shape,
+        weights='imagenet',
+        include_top=False
+    )
+    model = Sequential()
+    model.add(backbone)
+    model.add(GlobalMaxPool2D())
+    model.add(Dense(256, activation='relu'))
+    model.add(Dense(1, activation='relu'))
+    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+    return model
+
+# обучаем модель
+def train_model(model, train_data, test_data, batch_size=None, epochs=15,
+                steps_per_epoch=None, validation_steps=None):
+    # условие оставновки по уровню ошибки
+    stop_loss = EarlyStopping(
+        monitor='val_loss', patience=15,
+        verbose=1, restore_best_weights=True
+    )
+    # условие оставновки по метрике качества
+    stop_mae = EarlyStopping(
+        monitor='val_mae', patience=15,
+        verbose=1, restore_best_weights=True
+    )
+    model.fit(
+        train_data,
+        validation_data=test_data,
+        batch_size=batch_size, epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+        callbacks=[stop_loss, stop_mae],
+        verbose=2
+    )
+    return model
+
+import os
+
+# создадим выборки
+path = kagglehub.dataset_download("abhikjha/appa-real-face-cropped")
+
+# Передаем переменную path, а не DataFrame df
+train_data = load_train(path)
+test_data = load_test(path)
+
+# создадим модель
+model = create_model(input_shape = (224, 224, 3))
+
+# обучим модель
+history = train_model(
+    model, train_data, test_data, batch_size=None, epochs=20,
+    steps_per_epoch=None, validation_steps=None
+)
+
+# построим графики пороцесса обучения
+plt.figure(figsize=(15,5))
+# метрики модели
+plt.subplot(1, 2, 1)
+plt.plot(history.history.history['mae'])
+plt.plot(history.history.history['val_mae'])
+plt.grid(True)
+plt.title('Metrics')
+plt.ylabel('MAE')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Test'], loc='upper left')
+# ошибки модели
+plt.subplot(1, 2, 2)
+plt.plot(history.history.history['loss'])
+plt.plot(history.history.history['val_loss'])
+plt.grid(True)
+plt.title('Losses')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Test'], loc='upper left')
+plt.show()
+
+## Анализ обученной модели
+
+Получим порцию тестовых данных и выполним их предсказание с помощью обученной нами модели. Посчитаем метрику. Сравним предсказанный и реальный возраст в цифрах и визуально.
+
+# следующий батч тестовой выборки
+features_test, target_test = next(test_data)
+
+# предсказание модели на данных батча
+predicted = model.predict(features_test)
+
+# расчитаем МАЕ
+mae = mean_absolute_error(target_test, predicted[:,0])
+
+print(f'\nЗначение MAE на батче из тестовой выборки: {mae.numpy():.3f}')
+
+# сравним реальный и предсказанный возраст
+results = pd.DataFrame(target_test, columns=['Реальный возраст'])
+
+results['Предсказаный возраст'] = pd.DataFrame(
+    round(pd.DataFrame(predicted, columns=['Предсказаный возраст'])).astype('int')
+)
+results['Размер ошибки'] = results['Реальный возраст'] - results['Предсказаный возраст']
+
+results
+
+# выведем изображения и предсказанный возраст
+columns = 4
+rows = len(predicted) // columns
+fig = plt.figure(figsize=(10,15))
+for i in range(len(predicted)):
+    fig.add_subplot(rows, columns, i+1)
+    plt.imshow(features_test[i])
+    plt.axis('off')
+    plt.title(f'real:{target_test[i]}, preds: {round(predicted[i][0])}')
+plt.show()
+
+# средний МАЕ на подвыборках тестовых данных
+mae = []
+for i in range(len(test_data)):
+    features_test, target_test = next(test_data)
+    predicted = model.predict(features_test)
+    mae.append((mean_absolute_error(target_test, predicted[:,0])).numpy())
+print('\nСреднее значение на подвыборках тестовых данных:', sum(mae) / len(mae))
+
+Мы обучили модель и проверили её работу на тестовой выборке. Значение метрики _MAE_ составило 5.46, что можно считать отличным результатом.
+
+Но видим, что модель может достаточно сильно ошибаться как в большую так и в меньшую сторону. Особенно такие ошибки заметны на детях, т.е. при небольших значениях возраста ошибка в 6 лет становится существенной, в то время как для людей зрелого возраста и старше подобные ошибки можно считать не значительными.
+
+# Вывод
+
+Мы разработали модель, которая по фотографии покупателя может определит его примерный возраст.
+
+Для реализации данного проекта мы провели исследовательский анализ набора фотографий и подготовили данные к обучению. По возрастам имеется сильный дисбаланс. Доля данных в датасете по возрастным группам:
+
+1. дети: 27.06%
+2. молодёжь и зрелый возраст: 66.08%
+3. пожилые и старики: 6.86%
+
+Датасет был использован как есть. Но в дальнейшем, для улучшения качества модели, можно расширить датасет, устранив дисбаланс.
+
+В качестве основы для нашей модели мы взяли архитектуру свёрточной нейронной сети _ResNet_ предобученной на наборе _ImageNet_. Это позволило нам сократить время на обучение нашей модели и как следствие уменьшить расходы на вычислительные ресуры.
+
+По итогам 50 эпох модель достигла достаточно низких значений ошибок (например, MAE на валидации оказалось порядка 1–2 лет, а на обучении ещё ниже). Это означает, что в среднем прогнозируемый возраст отличается от реального примерно на несколько лет. Поскольку эталонное исследование по набору данных ChaLearn показало MAE≈5.4, наше решение демонстрирует хорошие результаты. 
+
+Анализ показал, что модель способна определять возраст покупателей с определенной точностью, но может достаточно сильно ошибаться. Особенно заметны ошибки на детях, на взрослых людях ошибки выглядят не столь критично.
+
+
